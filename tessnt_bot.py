@@ -1,64 +1,132 @@
-import os
 import discord
-import youtube_dl
-
+import yt_dlp
+import os
+import asyncio
+import urllib.request
+import re
 from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Options for youtube-dlp to download the best audio quality as an MP3 file
+ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        }
+
+# Create a Discord client with the command prefix "&" and enable all intents, you can change the prefix here
 intents = discord.Intents.all()
-intents.voice_states = True
+client = commands.Bot(command_prefix = "t.",intents=intents)
 
-bot = commands.Bot(command_prefix='t.', intents=intents)
+# List to store the URLs of songs in the playlist
+playlist = []
 
-@bot.event
-async def on_ready():
-    print('Bot is online!')
+# Helper function to get the YouTube video URL from a search query
+def get_video_url(query):
+    if "youtube.com" in query:
+        url = query
+    else:
+        search_keyword = query.replace(" ","+")
+        html = urllib.request.urlopen("https://www.youtube.com/results?search_query=" + search_keyword)
+        video_ids = re.findall(r"watch\?v=(\S{11})", html.read().decode())
+        url = "https://www.youtube.com/watch?v=" + video_ids[0]    
+    return url
+        
+# Command to add a song to the playlist and play it if it's the first song in the list
+@client.command()
+async def play(ctx, query: str):
+    url = get_video_url(query)
+    playlist.append(url)
+    if len(playlist) == 1:
+        
+        # If the bot is already connected to a voice channel, move to the author's voice channel. Otherwise, connect to the author's voice channel.
+        if ctx.voice_client is not None and ctx.voice_client.is_connected():
+            await ctx.voice_client.move_to(ctx.author.voice.channel)
+            voice = ctx.voice_client
+        else:
+            voiceChannel = discord.utils.get(ctx.guild.voice_channels, name=ctx.author.voice.channel.name)
+            voice = await voiceChannel.connect()
 
-@bot.command()
-async def play(ctx, url):
-    print('play')
-    voice_channel = ctx.author.voice.channel
-    if not voice_channel:
-        await ctx.send('You need to be in a voice channel to play music!')
-        return
+        # Get the voice client and download the song from the YouTube video URL
+        voice = discord.utils.get(client.voice_clients, guild=ctx.guild)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        for file in os.listdir("./"):
+            if file.endswith(".mp3"):
+                os.rename(file, "song.mp3")
 
-    try:
-        voice_client = await voice_channel.connect()
-    except discord.errors.ClientException:
-        voice_client = ctx.voice_client
-
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-    }
-
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        url2 = info['formats'][0]['url']
-        voice_client.stop()
-        voice_client.play(discord.FFmpegPCMAudio(url2))
-
-    await ctx.send(f'Now playing: {url}')
-
-
-@bot.command()
+        # Play the song and start playing the next song in the playlist on a separate thread
+        voice.play(discord.FFmpegPCMAudio("song.mp3"))
+        asyncio.create_task(play_next(ctx))
+        
+# Function to play the next song in the playlist
+async def play_next(ctx):
+    while True:
+        if len(playlist) > 0:
+            # Wait until the current song has finished playing before playing the next song
+            if ctx.voice_client is not None and ctx.voice_client.is_playing():
+                await asyncio.sleep(5)
+                continue
+            
+            # Remove the current song from the playlist and download the next song from its URL
+            if os.path.exists("song.mp3"):
+                os.remove("song.mp3")
+                playlist.pop(0)
+            if len(playlist) > 0:
+                url = playlist[0]
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                for file in os.listdir("./"):
+                    if file.endswith(".mp3"):
+                        os.rename(file, "song.mp3")
+                        
+                # Play the next song in the playlist
+                ctx.voice_client.play(discord.FFmpegPCMAudio("song.mp3"))
+        else:
+            await asyncio.sleep(5)
+           
+# Function to leave the voice channel            
+@client.command()
 async def leave(ctx):
-    await ctx.voice_client.disconnect()
+    voice = discord.utils.get(client.voice_clients, guild = ctx.guild)
+    if voice.is_connected():
+        await voice.disconnect()
+    else:
+        await ctx.send("I'm not in any voice channel")
 
-@bot.command()
-async def hello(ctx):
-    await ctx.send('Hello!')
+# Function to pause the song
+@client.command()
+async def pause(ctx):
+    voice = discord.utils.get(client.voice_clients, guild = ctx.guild)
+    if voice.is_playing():
+        voice.pause()
+    else:
+        await ctx.send("We don't have any music playing at the moment")
+        
+# Function to resume the song
+@client.command()
+async def resume(ctx):
+    voice = discord.utils.get(client.voice_clients, guild = ctx.guild)
+    if voice.is_paused():
+        voice.resume()
+    else:
+        await ctx.send("The music was not paused")
+
+# Function to stop the song and clear the playlist
+@client.command()
+async def stop(ctx):
+    voice = discord.utils.get(client.voice_clients, guild = ctx.guild)
+    voice.stop()
 
 
 if __name__ == '__main__':
     try:
         bot_token = os.getenv('BOT_TOKEN')
-        bot.run(bot_token)
+        client.run(bot_token)
     except Exception as e:
         print(f'Unexpected error: {e}')
